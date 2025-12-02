@@ -5,3 +5,4 @@ evaluate
 torch 
 pandas 
 numpy
+accelerate>=0.26.0
