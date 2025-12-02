@@ -380,14 +380,20 @@ with tab2:
                 params_table = {
                     "Parameter": ["Dataset", "Model", "Train Size", "Test Size", 
                                  "Epochs", "Batch Size", "Learning Rate", "Labels"],
-                    "Value": [st.session_state.dataset_name, 
-                             st.session_state.model_name.split("/")[-1],
-                             len(st.session_state.tokenized_datasets["train"]),
-                             len(st.session_state.tokenized_datasets["test"]),
-                             epochs, batch_size, learning_rate, 
-                             st.session_state.num_labels]
+                    "Value": [str(st.session_state.dataset_name),  # Convert to string
+                             str(st.session_state.model_name.split("/")[-1]),
+                             str(len(st.session_state.tokenized_datasets["train"])),  # Convert to string
+                             str(len(st.session_state.tokenized_datasets["test"])),
+                             str(epochs),  # Convert to string
+                             str(batch_size),
+                             str(learning_rate),  # Convert to string
+                             str(st.session_state.num_labels)]  # Convert to string
                 }
-                st.table(pd.DataFrame(params_table))
+                # Create DataFrame with explicit dtype
+                df_params = pd.DataFrame(params_table)
+                # Ensure all values are strings
+                df_params['Value'] = df_params['Value'].astype(str)
+                st.table(df_params)
             
             if st.button("Start Fine-tuning", type="primary"):
                 # Create output directory
