@@ -406,14 +406,16 @@ with tab2:
                         return accuracy_metric.compute(predictions=predictions, references=labels)
                     
                     # Set training arguments
+
+                    # Set training arguments
                     training_args = TrainingArguments(
                         output_dir=output_dir,
                         num_train_epochs=epochs,
                         per_device_train_batch_size=batch_size,
                         per_device_eval_batch_size=batch_size,
                         learning_rate=learning_rate,
-                        evaluation_strategy="epoch",
-                        save_strategy="epoch",
+                        eval_strategy="epoch",  # Changed from evaluation_strategy
+                        save_strategy="epoch",  # Keep this as is
                         logging_dir=f'{output_dir}/logs',
                         logging_steps=10,
                         load_best_model_at_end=True,
@@ -423,7 +425,7 @@ with tab2:
                         save_total_limit=2,
                         fp16=torch.cuda.is_available(),
                     )
-                    
+                                    
                     # Create Trainer
                     trainer = Trainer(
                         model=st.session_state.model,
