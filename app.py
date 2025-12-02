@@ -16,6 +16,12 @@ from transformers import (
 import evaluate
 from huggingface_hub import login
 import json
+import warnings
+
+# Suppress specific warnings
+warnings.filterwarnings("ignore", 
+                       message="'pin_memory' argument is set as true but no accelerator is found",
+                       category=UserWarning)
 
 # Set page configuration
 st.set_page_config(
@@ -72,7 +78,7 @@ with st.sidebar:
     try:
         if st.button("🔍 Check Dataset Availability"):
             with st.spinner("Checking dataset availability..."):
-                dataset_info = load_dataset(dataset_name, trust_remote_code=True)
+                dataset_info = load_dataset(dataset_name)  # No trust_remote_code
                 available_splits = list(dataset_info.keys())
                 st.success(f"Dataset found: {dataset_name}")
                 st.info(f"Available splits: {', '.join(available_splits)}")
@@ -173,16 +179,14 @@ with tab1:
     if st.button("🚀 Load Dataset", type="primary"):
         with st.spinner("Loading dataset..."):
             try:
-                # Load dataset
+                # Load dataset WITHOUT trust_remote_code
                 train_dataset = load_dataset(
                     dataset_name, 
-                    split=f"{train_split}[:{train_size}]",
-                    trust_remote_code=True
+                    split=f"{train_split}[:{train_size}]"
                 )
                 test_dataset = load_dataset(
                     dataset_name, 
-                    split=f"{test_split}[:{test_size}]",
-                    trust_remote_code=True
+                    split=f"{test_split}[:{test_size}]"
                 )
                 
                 # Create DatasetDict
@@ -228,13 +232,17 @@ with tab1:
                     
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.bar_chart(train_labels, use_container_width=True)
+                        st.bar_chart(train_labels, width='stretch')
                     with col2:
+                        label_df = train_labels.reset_index().rename(
+                            columns={"index": "Label", 0: "Count"}
+                        )
+                        # Ensure proper types
+                        label_df['Label'] = label_df['Label'].astype(str)
+                        label_df['Count'] = label_df['Count'].astype(int)
                         st.dataframe(
-                            train_labels.reset_index().rename(
-                                columns={"index": "Label", 0: "Count"}
-                            ),
-                            use_container_width=True,
+                            label_df,
+                            width='stretch',
                             hide_index=True
                         )
                     
@@ -254,7 +262,12 @@ with tab1:
                     sample = {k: train_dataset[i][k] for k in train_dataset.features.keys()}
                     sample_data.append(sample)
                 
-                st.dataframe(pd.DataFrame(sample_data), use_container_width=True)
+                # Create safe DataFrame
+                df_samples = pd.DataFrame(sample_data)
+                for col in df_samples.columns:
+                    df_samples[col] = df_samples[col].astype(str)
+                
+                st.dataframe(df_samples, width='stretch')
                 
             except Exception as e:
                 st.error(f"Error loading dataset: {e}")
@@ -324,8 +337,7 @@ with tab2:
                                 text_field = "content"
                             else:
                                 # Use the first non-label field
-                                available_fields = [k for k in examples.keys() if k != "label"]
-                                text_field = available_fields[0] if available_fields else list(examples.keys())[0]
+                                text_field = [k for k in examples.keys() if k != "label"][0]
                             
                             return st.session_state.tokenizer(
                                 examples[text_field],
@@ -344,7 +356,7 @@ with tab2:
                         tokenized_datasets = st.session_state.dataset.map(
                             tokenize_function,
                             batched=True,
-                            remove_columns=columns_to_remove  # Only remove non-label columns
+                            remove_columns=columns_to_remove
                         )
                         
                         # Set format for PyTorch
@@ -367,9 +379,6 @@ with tab2:
                         
                     except Exception as e:
                         st.error(f"Error during data preprocessing: {e}")
-                        import traceback
-                        with st.expander("View Error Details"):
-                            st.code(traceback.format_exc())
         
         # Model Training
         if st.session_state.data_preprocessed:
@@ -380,19 +389,16 @@ with tab2:
                 params_table = {
                     "Parameter": ["Dataset", "Model", "Train Size", "Test Size", 
                                  "Epochs", "Batch Size", "Learning Rate", "Labels"],
-                    "Value": [str(st.session_state.dataset_name),  # Convert to string
-                             str(st.session_state.model_name.split("/")[-1]),
-                             str(len(st.session_state.tokenized_datasets["train"])),  # Convert to string
-                             str(len(st.session_state.tokenized_datasets["test"])),
-                             str(epochs),  # Convert to string
-                             str(batch_size),
-                             str(learning_rate),  # Convert to string
-                             str(st.session_state.num_labels)]  # Convert to string
+                    "Value": [st.session_state.dataset_name, 
+                             st.session_state.model_name.split("/")[-1],
+                             len(st.session_state.tokenized_datasets["train"]),
+                             len(st.session_state.tokenized_datasets["test"]),
+                             epochs, batch_size, learning_rate, 
+                             st.session_state.num_labels]
                 }
-                # Create DataFrame with explicit dtype
                 df_params = pd.DataFrame(params_table)
-                # Ensure all values are strings
-                df_params['Value'] = df_params['Value'].astype(str)
+                for col in df_params.columns:
+                    df_params[col] = df_params[col].astype(str)
                 st.table(df_params)
             
             if st.button("Start Fine-tuning", type="primary"):
@@ -412,16 +418,14 @@ with tab2:
                         return accuracy_metric.compute(predictions=predictions, references=labels)
                     
                     # Set training arguments
-
-                    # Set training arguments
                     training_args = TrainingArguments(
                         output_dir=output_dir,
                         num_train_epochs=epochs,
                         per_device_train_batch_size=batch_size,
                         per_device_eval_batch_size=batch_size,
                         learning_rate=learning_rate,
-                        eval_strategy="epoch",  # Changed from evaluation_strategy
-                        save_strategy="epoch",  # Keep this as is
+                        eval_strategy="epoch",
+                        save_strategy="epoch",
                         logging_dir=f'{output_dir}/logs',
                         logging_steps=10,
                         load_best_model_at_end=True,
@@ -431,7 +435,7 @@ with tab2:
                         save_total_limit=2,
                         fp16=torch.cuda.is_available(),
                     )
-                                    
+                    
                     # Create Trainer
                     trainer = Trainer(
                         model=st.session_state.model,
@@ -607,14 +611,17 @@ with tab3:
                     prob_df = prob_df.sort_values("Probability", ascending=False)
                     
                     # Display table
+                    display_df = prob_df.copy()
+                    display_df['Class'] = display_df['Class'].astype(str)
+                    display_df['Probability'] = display_df['Probability'].apply(lambda x: f"{x:.4f}")
                     st.dataframe(
-                        prob_df.style.format({"Probability": "{:.4f}"}),
-                        use_container_width=True,
+                        display_df,
+                        width='stretch',
                         hide_index=True
                     )
                     
                     # Display bar chart
-                    st.bar_chart(prob_df.set_index("Class")["Probability"], use_container_width=True)
+                    st.bar_chart(prob_df.set_index("Class")["Probability"], width='stretch')
                     
                 except Exception as e:
                     st.error(f"Error during prediction: {e}")
@@ -625,19 +632,3 @@ st.caption("""
 Note: This application uses Hugging Face's Transformers and Datasets libraries.
 Training time depends on dataset size, model complexity, and hardware configuration.
 """)
-
-# Add some styling
-st.markdown("""
-<style>
-    .stProgress > div > div > div > div {
-        background-color: #1f77b4;
-    }
-    .stButton > button {
-        width: 100%;
-    }
-    .stExpander {
-        border: 1px solid #e0e0e0;
-        border-radius: 5px;
-    }
-</style>
-""", unsafe_allow_html=True)
