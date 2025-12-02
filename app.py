@@ -4,8 +4,7 @@ import numpy as np
 import torch
 import zipfile
 import os
-import tempfile
-from pathlib import Path
+import warnings
 from datasets import load_dataset, DatasetDict
 from transformers import (
     AutoTokenizer,
@@ -16,7 +15,6 @@ from transformers import (
 import evaluate
 from huggingface_hub import login
 import json
-import warnings
 
 # Suppress specific warnings
 warnings.filterwarnings("ignore", 
@@ -31,21 +29,19 @@ st.set_page_config(
 )
 
 # App title
-st.title("🤖 Transformer Model Fine-tuning Tool")
+st.title("🤖 One-Click Transformer Model Fine-tuning")
 st.markdown("""
-This application allows you to fine-tune models using Hugging Face datasets and models.
-You can customize the dataset, model, and training parameters.
+This application allows you to fine-tune transformer models with a single click.
+All configuration is done in the sidebar.
 """)
 
 # Initialize session state variables
-if 'dataset_loaded' not in st.session_state:
-    st.session_state.dataset_loaded = False
-if 'model_loaded' not in st.session_state:
-    st.session_state.model_loaded = False
-if 'data_preprocessed' not in st.session_state:
-    st.session_state.data_preprocessed = False
+if 'training_complete' not in st.session_state:
+    st.session_state.training_complete = False
 if 'model_trained' not in st.session_state:
     st.session_state.model_trained = False
+if 'output_dir' not in st.session_state:
+    st.session_state.output_dir = "./fine_tuned_model"
 
 # Sidebar - Configuration
 with st.sidebar:
@@ -72,35 +68,6 @@ with st.sidebar:
         value="yelp_review_full",
         help="Examples: yelp_review_full, imdb, emotion, etc."
     )
-    
-    # Try to get dataset info
-    available_splits = ["train", "test", "validation"]
-    try:
-        if st.button("🔍 Check Dataset Availability"):
-            with st.spinner("Checking dataset availability..."):
-                dataset_info = load_dataset(dataset_name)  # No trust_remote_code
-                available_splits = list(dataset_info.keys())
-                st.success(f"Dataset found: {dataset_name}")
-                st.info(f"Available splits: {', '.join(available_splits)}")
-    except Exception as e:
-        st.error(f"Unable to check dataset: {e}")
-        st.info("Using default splits: train, test, validation")
-    
-    # Dataset split selection
-    col1, col2 = st.columns(2)
-    with col1:
-        train_split = st.selectbox(
-            "Train Split",
-            available_splits,
-            index=0 if "train" in available_splits else 0
-        )
-    
-    with col2:
-        test_split = st.selectbox(
-            "Test Split",
-            available_splits,
-            index=1 if len(available_splits) > 1 else 0
-        )
     
     # Dataset size settings
     col1, col2 = st.columns(2)
@@ -169,24 +136,59 @@ with st.sidebar:
         "Output Directory",
         value="./fine_tuned_model"
     )
-
-# Main area
-tab1, tab2, tab3 = st.tabs(["📥 Data Loading", "⚡ Model Training", "📤 Model Testing"])
-
-with tab1:
-    st.header("Data Loading & Preprocessing")
     
-    if st.button("🚀 Load Dataset", type="primary"):
-        with st.spinner("Loading dataset..."):
-            try:
-                # Load dataset WITHOUT trust_remote_code
+    st.session_state.output_dir = output_dir
+
+# Main workflow
+st.header("📋 Workflow Summary")
+
+# Display configuration summary
+with st.expander("📋 View Configuration", expanded=True):
+    config_table = {
+        "Setting": ["Dataset", "Train Size", "Test Size", "Model", 
+                   "Epochs", "Batch Size", "Learning Rate", "Output Directory"],
+        "Value": [dataset_name, train_size, test_size, model_name,
+                 epochs, batch_size, f"{learning_rate:.6f}", output_dir]
+    }
+    
+    config_df = pd.DataFrame(config_table)
+    # Ensure all values are strings for display
+    for col in config_df.columns:
+        config_df[col] = config_df[col].astype(str)
+    
+    st.table(config_df)
+
+# Single start button
+col1, col2, col3 = st.columns([1, 2, 1])
+with col2:
+    start_button = st.button("🚀 Start Fine-tuning Process", type="primary", use_container_width=True)
+
+if start_button:
+    # Create progress containers
+    progress_container = st.container()
+    status_container = st.container()
+    results_container = st.container()
+    
+    with progress_container:
+        st.subheader("📊 Progress")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+    
+    # Step 1: Load Dataset
+    with status_container:
+        st.subheader("🔍 Step 1: Loading Dataset")
+        status_text.text("Loading dataset...")
+        
+        try:
+            with st.spinner("Loading dataset..."):
+                # Load dataset
                 train_dataset = load_dataset(
                     dataset_name, 
-                    split=f"{train_split}[:{train_size}]"
+                    split=f"train[:{train_size}]"
                 )
                 test_dataset = load_dataset(
                     dataset_name, 
-                    split=f"{test_split}[:{test_size}]"
+                    split=f"test[:{test_size}]"
                 )
                 
                 # Create DatasetDict
@@ -195,379 +197,336 @@ with tab1:
                     "test": test_dataset
                 })
                 
-                # Show dataset information
-                st.success("Dataset loaded successfully!")
+                st.success("✅ Dataset loaded successfully!")
                 
-                # Display metrics
-                col1, col2, col3 = st.columns(3)
+                # Display dataset info
+                col1, col2 = st.columns(2)
                 with col1:
                     st.metric("Training Samples", len(train_dataset))
                 with col2:
                     st.metric("Test Samples", len(test_dataset))
                 
-                # Display dataset structure
-                with st.expander("📋 Dataset Structure", expanded=True):
-                    st.json({
-                        "train": {
-                            "features": list(train_dataset.features.keys()),
-                            "num_rows": len(train_dataset)
-                        },
-                        "test": {
-                            "features": list(test_dataset.features.keys()),
-                            "num_rows": len(test_dataset)
-                        }
-                    })
+                # Detect label column
+                def get_label_info(dataset):
+                    """Safely extract label information from dataset."""
+                    possible_label_columns = ['label', 'labels', 'Label', 'Labels', 'class', 'Class', 
+                                            'rating', 'Rating', 'sentiment', 'Sentiment', 'score', 'Score']
+                    
+                    for label_col in possible_label_columns:
+                        if label_col in dataset.features:
+                            try:
+                                unique_labels = len(set(dataset[label_col]))
+                                return label_col, unique_labels
+                            except Exception:
+                                continue
+                    
+                    # Try any column
+                    for col in dataset.features:
+                        try:
+                            if isinstance(dataset[col][0], (int, float, str)):
+                                unique_labels = len(set(dataset[col]))
+                                return col, unique_labels
+                        except Exception:
+                            continue
+                    
+                    return None, None
                 
-                # Detect number of labels
-                if "label" in train_dataset.features:
-                    num_labels = len(set(train_dataset["label"]))
-                    with col3:
-                        st.metric("Number of Labels", num_labels)
-                    
-                    # Show label distribution
-                    st.subheader("📊 Label Distribution")
-                    
-                    # Training set label distribution
-                    train_labels = pd.Series(train_dataset["label"]).value_counts().sort_index()
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.bar_chart(train_labels, width='stretch')
-                    with col2:
-                        label_df = train_labels.reset_index().rename(
-                            columns={"index": "Label", 0: "Count"}
-                        )
-                        # Ensure proper types
-                        label_df['Label'] = label_df['Label'].astype(str)
-                        label_df['Count'] = label_df['Count'].astype(int)
-                        st.dataframe(
-                            label_df,
-                            width='stretch',
-                            hide_index=True
-                        )
+                label_column, num_labels = get_label_info(train_dataset)
+                
+                if label_column and num_labels is not None:
+                    st.metric("Number of Labels", num_labels)
                     
                     # Save to session state
                     st.session_state.dataset = dataset
                     st.session_state.num_labels = num_labels
-                    st.session_state.dataset_loaded = True
-                    st.session_state.dataset_name = dataset_name
+                    st.session_state.label_column = label_column
+                    
+                    progress_bar.progress(20)
+                    status_text.text("Dataset loaded. Initializing model...")
+                    
                 else:
-                    st.error("No 'label' field found in the dataset")
-                    st.session_state.dataset_loaded = False
-                    
-                # Show sample examples
-                st.subheader("🔍 Sample Data Examples")
-                sample_data = []
-                for i in range(min(5, len(train_dataset))):
-                    sample = {k: train_dataset[i][k] for k in train_dataset.features.keys()}
-                    sample_data.append(sample)
+                    st.error("No suitable label column found in the dataset")
+                    st.info(f"Available columns: {list(train_dataset.features.keys())}")
+                    return
                 
-                # Create safe DataFrame
-                df_samples = pd.DataFrame(sample_data)
-                for col in df_samples.columns:
-                    df_samples[col] = df_samples[col].astype(str)
-                
-                st.dataframe(df_samples, width='stretch')
-                
-            except Exception as e:
-                st.error(f"Error loading dataset: {e}")
-                st.code(str(e), language="bash")
-                st.session_state.dataset_loaded = False
-
-with tab2:
-    st.header("Model Training & Evaluation")
+        except Exception as e:
+            st.error(f"Error loading dataset: {e}")
+            import traceback
+            with st.expander("View Error Details"):
+                st.code(traceback.format_exc())
+            return
     
-    if not st.session_state.dataset_loaded:
-        st.warning("⚠️ Please load a dataset first in the 'Data Loading' tab")
-    else:
-        # Model Initialization
-        st.subheader("🔧 Model Initialization")
-        
-        if st.button("Initialize Model and Tokenizer", type="primary"):
-            with st.spinner("Loading model and tokenizer..."):
-                try:
-                    # Load tokenizer and model
-                    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-                    model = AutoModelForSequenceClassification.from_pretrained(
-                        model_name,
-                        num_labels=st.session_state.num_labels
-                    )
-                    
-                    st.success("✅ Model and Tokenizer loaded successfully!")
-                    
-                    # Save to session state
-                    st.session_state.tokenizer = tokenizer
-                    st.session_state.model = model
-                    st.session_state.model_loaded = True
-                    st.session_state.model_name = model_name
-                    
-                    # Display model information
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Model", model_name.split("/")[-1])
-                    with col2:
-                        st.metric("Tokenizer", tokenizer_name.split("/")[-1])
-                    with col3:
-                        st.metric("Labels", st.session_state.num_labels)
-                    
-                    # Display model configuration
-                    with st.expander("🔍 View Model Configuration"):
-                        config_dict = model.config.to_dict()
-                        st.json(config_dict)
-                        
-                except Exception as e:
-                    st.error(f"Error loading model: {e}")
-                    st.session_state.model_loaded = False
-        
-        # Data Preprocessing
-        if st.session_state.model_loaded:
-            st.subheader("🔄 Data Preprocessing")
+    # Step 2: Initialize Model and Tokenizer
+    st.subheader("🔧 Step 2: Initializing Model and Tokenizer")
+    status_text.text("Loading model and tokenizer...")
+    
+    try:
+        with st.spinner("Loading model and tokenizer..."):
+            # Load tokenizer and model
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+            model = AutoModelForSequenceClassification.from_pretrained(
+                model_name,
+                num_labels=st.session_state.num_labels
+            )
             
-            if st.button("Preprocess Data", type="primary"):
-                with st.spinner("Preprocessing data..."):
-                    try:
-                        # Define tokenize function
-                        def tokenize_function(examples):
-                            # Check if text field exists, if not use the first field
-                            if "text" in examples:
-                                text_field = "text"
-                            elif "review" in examples:
-                                text_field = "review"
-                            elif "content" in examples:
-                                text_field = "content"
-                            else:
-                                # Use the first non-label field
-                                text_field = [k for k in examples.keys() if k != "label"][0]
-                            
-                            return st.session_state.tokenizer(
-                                examples[text_field],
-                                padding="max_length",
-                                truncation=True,
-                                max_length=512
-                            )
-                        
-                        # Get column names to remove (all except label)
-                        columns_to_remove = [
-                            col for col in st.session_state.dataset["train"].column_names 
-                            if col != "label"
-                        ]
-                        
-                        # Apply tokenization
-                        tokenized_datasets = st.session_state.dataset.map(
-                            tokenize_function,
-                            batched=True,
-                            remove_columns=columns_to_remove
-                        )
-                        
-                        # Set format for PyTorch
-                        tokenized_datasets.set_format("torch")
-                        
-                        st.success("✅ Data preprocessing completed!")
-                        
-                        # Show tokenized example
-                        with st.expander("🔍 View Tokenized Example"):
-                            example = tokenized_datasets["train"][0]
-                            st.json({
-                                "input_ids (first 10)": example["input_ids"][:10].tolist(),
-                                "attention_mask (first 10)": example["attention_mask"][:10].tolist(),
-                                "label": example["label"].item() if hasattr(example["label"], 'item') else example["label"]
-                            })
-                        
-                        # Save to session state
-                        st.session_state.tokenized_datasets = tokenized_datasets
-                        st.session_state.data_preprocessed = True
-                        
-                    except Exception as e:
-                        st.error(f"Error during data preprocessing: {e}")
-        
-        # Model Training
-        if st.session_state.data_preprocessed:
-            st.subheader("🏃‍♂️ Model Training")
+            st.success("✅ Model and Tokenizer loaded successfully!")
             
-            # Training parameters summary
-            with st.expander("📋 Training Parameters Summary"):
-                params_table = {
-                    "Parameter": ["Dataset", "Model", "Train Size", "Test Size", 
-                                 "Epochs", "Batch Size", "Learning Rate", "Labels"],
-                    "Value": [st.session_state.dataset_name, 
-                             st.session_state.model_name.split("/")[-1],
-                             len(st.session_state.tokenized_datasets["train"]),
-                             len(st.session_state.tokenized_datasets["test"]),
-                             epochs, batch_size, learning_rate, 
-                             st.session_state.num_labels]
-                }
-                df_params = pd.DataFrame(params_table)
-                for col in df_params.columns:
-                    df_params[col] = df_params[col].astype(str)
-                st.table(df_params)
-            
-            if st.button("Start Fine-tuning", type="primary"):
-                # Create output directory
-                os.makedirs(output_dir, exist_ok=True)
-                
-                # Progress tracking
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                try:
-                    # Define compute metrics function
-                    def compute_metrics(eval_pred):
-                        logits, labels = eval_pred
-                        predictions = np.argmax(logits, axis=-1)
-                        accuracy_metric = evaluate.load("accuracy")
-                        return accuracy_metric.compute(predictions=predictions, references=labels)
-                    
-                    # Set training arguments
-                    training_args = TrainingArguments(
-                        output_dir=output_dir,
-                        num_train_epochs=epochs,
-                        per_device_train_batch_size=batch_size,
-                        per_device_eval_batch_size=batch_size,
-                        learning_rate=learning_rate,
-                        eval_strategy="epoch",
-                        save_strategy="epoch",
-                        logging_dir=f'{output_dir}/logs',
-                        logging_steps=10,
-                        load_best_model_at_end=True,
-                        metric_for_best_model="accuracy",
-                        greater_is_better=True,
-                        report_to="none",
-                        save_total_limit=2,
-                        fp16=torch.cuda.is_available(),
-                    )
-                    
-                    # Create Trainer
-                    trainer = Trainer(
-                        model=st.session_state.model,
-                        args=training_args,
-                        train_dataset=st.session_state.tokenized_datasets["train"],
-                        eval_dataset=st.session_state.tokenized_datasets["test"],
-                        compute_metrics=compute_metrics,
-                    )
-                    
-                    # Train the model
-                    status_text.text("Starting training...")
-                    train_result = trainer.train()
-                    
-                    st.success("🎉 Model training completed!")
-                    
-                    # Display training results
-                    st.subheader("📊 Training Results")
-                    
-                    # Format train output
-                    train_output = {
-                        "global_step": train_result.global_step,
-                        "training_loss": float(train_result.training_loss),
-                        "metrics": train_result.metrics
-                    }
-                    
-                    st.code(f"TrainOutput({train_output})", language="python")
-                    
-                    # Evaluate the model
-                    st.subheader("📈 Evaluation Results")
-                    eval_result = trainer.evaluate()
-                    
-                    # Format evaluation results
-                    eval_output = {
-                        'eval_loss': eval_result['eval_loss'],
-                        'eval_accuracy': eval_result['eval_accuracy'],
-                        'eval_runtime': eval_result['eval_runtime'],
-                        'eval_samples_per_second': eval_result['eval_samples_per_second'],
-                        'eval_steps_per_second': eval_result['eval_steps_per_second'],
-                        'epoch': eval_result['epoch']
-                    }
-                    
-                    st.code(json.dumps(eval_output, indent=2), language="json")
-                    
-                    # Save the model
-                    trainer.save_model(output_dir)
-                    st.success(f"✅ Model saved to: {output_dir}")
-                    
-                    # Save to session state
-                    st.session_state.trainer = trainer
-                    st.session_state.model_trained = True
-                    st.session_state.output_dir = output_dir
-                    
-                    # Display metrics
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Evaluation Loss", f"{eval_result['eval_loss']:.4f}")
-                    with col2:
-                        st.metric("Evaluation Accuracy", f"{eval_result['eval_accuracy']:.4f}")
-                    with col3:
-                        st.metric("Training Time", f"{train_result.metrics.get('train_runtime', 0):.2f}s")
-                    
-                    # Update progress
-                    progress_bar.progress(100)
-                    status_text.text("Training completed successfully!")
-                    
-                except Exception as e:
-                    st.error(f"Error during training: {e}")
-                    import traceback
-                    with st.expander("View Error Details"):
-                        st.code(traceback.format_exc())
-        
-        # Model Download Section
-        if st.session_state.model_trained:
-            st.subheader("📦 Model Download")
-            
-            # Create ZIP file function
-            def create_zip_file(model_dir, zip_name):
-                zip_path = f"{zip_name}.zip"
-                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                    for root, dirs, files in os.walk(model_dir):
-                        for file in files:
-                            file_path = os.path.join(root, file)
-                            arcname = os.path.relpath(file_path, start=model_dir)
-                            zipf.write(file_path, arcname)
-                return zip_path
-            
+            # Display model info
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("💾 Package Model for Download"):
-                    with st.spinner("Packaging model..."):
-                        try:
-                            zip_path = create_zip_file(
-                                st.session_state.output_dir,
-                                "fine_tuned_model"
-                            )
-                            st.session_state.zip_path = zip_path
-                            st.success("✅ Model packaged successfully!")
-                        except Exception as e:
-                            st.error(f"Error packaging model: {e}")
-            
+                st.metric("Model", model_name.split("/")[-1])
             with col2:
-                if 'zip_path' in st.session_state and os.path.exists(st.session_state.zip_path):
-                    with open(st.session_state.zip_path, "rb") as f:
-                        st.download_button(
-                            label="⬇️ Download Model (ZIP)",
-                            data=f,
-                            file_name="fine_tuned_model.zip",
-                            mime="application/zip",
-                            type="primary"
-                        )
-
-with tab3:
-    st.header("Model Testing")
+                st.metric("Tokenizer", tokenizer_name.split("/")[-1])
+            
+            # Save to session state
+            st.session_state.tokenizer = tokenizer
+            st.session_state.model = model
+            
+            progress_bar.progress(40)
+            status_text.text("Model initialized. Preprocessing data...")
+            
+    except Exception as e:
+        st.error(f"Error loading model: {e}")
+        import traceback
+        with st.expander("View Error Details"):
+            st.code(traceback.format_exc())
+        return
     
-    if not st.session_state.model_trained:
-        st.warning("⚠️ Please train a model first in the 'Model Training' tab")
-    else:
-        st.subheader("🔍 Test the Fine-tuned Model")
+    # Step 3: Data Preprocessing
+    st.subheader("🔄 Step 3: Data Preprocessing")
+    status_text.text("Preprocessing data...")
+    
+    try:
+        with st.spinner("Preprocessing data..."):
+            # Define tokenize function
+            def tokenize_function(examples):
+                # Get text column
+                text_field = None
+                possible_text_fields = ['text', 'review', 'content', 'sentence', 'comment', 
+                                      'article', 'description', 'summary']
+                
+                for field in possible_text_fields:
+                    if field in examples:
+                        text_field = field
+                        break
+                
+                # If no common text field found, use first non-label field
+                if text_field is None:
+                    available_fields = [k for k in examples.keys() 
+                                      if k != st.session_state.label_column]
+                    if available_fields:
+                        text_field = available_fields[0]
+                    else:
+                        text_field = list(examples.keys())[0]
+                
+                return st.session_state.tokenizer(
+                    examples[text_field],
+                    padding="max_length",
+                    truncation=True,
+                    max_length=512
+                )
+            
+            # Get column names to remove (all except label column)
+            columns_to_remove = [
+                col for col in st.session_state.dataset["train"].column_names 
+                if col != st.session_state.label_column
+            ]
+            
+            # Apply tokenization
+            tokenized_datasets = st.session_state.dataset.map(
+                tokenize_function,
+                batched=True,
+                remove_columns=columns_to_remove
+            )
+            
+            # Rename label column to 'labels' for compatibility
+            if st.session_state.label_column != 'labels':
+                def rename_labels(example):
+                    example['labels'] = example[st.session_state.label_column]
+                    return example
+                
+                tokenized_datasets = tokenized_datasets.map(rename_labels)
+            
+            # Set format for PyTorch
+            tokenized_datasets.set_format("torch")
+            
+            st.success("✅ Data preprocessing completed!")
+            
+            # Save to session state
+            st.session_state.tokenized_datasets = tokenized_datasets
+            
+            progress_bar.progress(60)
+            status_text.text("Data preprocessed. Starting training...")
+            
+    except Exception as e:
+        st.error(f"Error during data preprocessing: {e}")
+        import traceback
+        with st.expander("View Error Details"):
+            st.code(traceback.format_exc())
+        return
+    
+    # Step 4: Model Training
+    st.subheader("🏃‍♂️ Step 4: Model Training")
+    status_text.text("Training model...")
+    
+    try:
+        with st.spinner("Training model. This may take several minutes..."):
+            # Create output directory
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Define compute metrics function
+            def compute_metrics(eval_pred):
+                logits, labels = eval_pred
+                predictions = np.argmax(logits, axis=-1)
+                accuracy_metric = evaluate.load("accuracy")
+                return accuracy_metric.compute(predictions=predictions, references=labels)
+            
+            # Set training arguments
+            training_args = TrainingArguments(
+                output_dir=output_dir,
+                num_train_epochs=epochs,
+                per_device_train_batch_size=batch_size,
+                per_device_eval_batch_size=batch_size,
+                learning_rate=learning_rate,
+                eval_strategy="epoch",
+                save_strategy="epoch",
+                logging_dir=f'{output_dir}/logs',
+                logging_steps=10,
+                load_best_model_at_end=True,
+                metric_for_best_model="accuracy",
+                greater_is_better=True,
+                report_to="none",
+                save_total_limit=2,
+                fp16=torch.cuda.is_available(),
+            )
+            
+            # Create Trainer
+            trainer = Trainer(
+                model=st.session_state.model,
+                args=training_args,
+                train_dataset=st.session_state.tokenized_datasets["train"],
+                eval_dataset=st.session_state.tokenized_datasets["test"],
+                compute_metrics=compute_metrics,
+            )
+            
+            # Train the model
+            train_result = trainer.train()
+            
+            # Evaluate the model
+            eval_result = trainer.evaluate()
+            
+            # Save the model
+            trainer.save_model(output_dir)
+            
+            st.success("🎉 Model training completed!")
+            
+            # Update progress
+            progress_bar.progress(100)
+            status_text.text("Training completed successfully!")
+            
+            # Save to session state
+            st.session_state.trainer = trainer
+            st.session_state.model_trained = True
+            st.session_state.training_complete = True
+            st.session_state.train_result = train_result
+            st.session_state.eval_result = eval_result
+            
+    except Exception as e:
+        st.error(f"Error during training: {e}")
+        import traceback
+        with st.expander("View Error Details"):
+            st.code(traceback.format_exc())
+        return
+
+# Display results if training is complete
+if st.session_state.training_complete:
+    with results_container:
+        st.header("📊 Training Results")
         
-        # Test with sample text
+        # Display metrics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Evaluation Loss", f"{st.session_state.eval_result['eval_loss']:.4f}")
+        with col2:
+            st.metric("Evaluation Accuracy", f"{st.session_state.eval_result['eval_accuracy']:.4f}")
+        with col3:
+            runtime = st.session_state.train_result.metrics.get('train_runtime', 0)
+            st.metric("Training Time", f"{runtime:.2f}s")
+        
+        # Detailed results
+        with st.expander("📈 View Detailed Results"):
+            st.subheader("Training Metrics")
+            train_metrics = {
+                "Global Steps": st.session_state.train_result.global_step,
+                "Training Loss": float(st.session_state.train_result.training_loss),
+                "Train Runtime": st.session_state.train_result.metrics.get('train_runtime', 0),
+                "Train Samples per Second": st.session_state.train_result.metrics.get('train_samples_per_second', 0),
+                "Train Steps per Second": st.session_state.train_result.metrics.get('train_steps_per_second', 0),
+                "Epoch": st.session_state.train_result.metrics.get('epoch', 0)
+            }
+            st.json(train_metrics)
+            
+            st.subheader("Evaluation Metrics")
+            st.json({
+                'eval_loss': st.session_state.eval_result['eval_loss'],
+                'eval_accuracy': st.session_state.eval_result['eval_accuracy'],
+                'eval_runtime': st.session_state.eval_result['eval_runtime'],
+                'eval_samples_per_second': st.session_state.eval_result['eval_samples_per_second'],
+                'eval_steps_per_second': st.session_state.eval_result['eval_steps_per_second'],
+                'epoch': st.session_state.eval_result['epoch']
+            })
+        
+        # Model Download Section
+        st.divider()
+        st.header("📦 Download Fine-tuned Model")
+        
+        # Create ZIP file function
+        def create_zip_file(model_dir, zip_name):
+            zip_path = f"{zip_name}.zip"
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for root, dirs, files in os.walk(model_dir):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.relpath(file_path, start=model_dir)
+                        zipf.write(file_path, arcname)
+            return zip_path
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("💾 Package Model for Download"):
+                with st.spinner("Packaging model..."):
+                    try:
+                        zip_path = create_zip_file(
+                            st.session_state.output_dir,
+                            "fine_tuned_model"
+                        )
+                        st.session_state.zip_path = zip_path
+                        st.success("✅ Model packaged successfully!")
+                    except Exception as e:
+                        st.error(f"Error packaging model: {e}")
+        
+        with col2:
+            if 'zip_path' in st.session_state and os.path.exists(st.session_state.zip_path):
+                with open(st.session_state.zip_path, "rb") as f:
+                    st.download_button(
+                        label="⬇️ Download Model (ZIP)",
+                        data=f,
+                        file_name="fine_tuned_model.zip",
+                        mime="application/zip",
+                        type="primary"
+                    )
+        
+        # Test the model
+        st.divider()
+        st.header("🔍 Test Your Fine-tuned Model")
+        
         test_text = st.text_area(
-            "Enter text for testing",
-            value="dr. goldberg offers everything i look for in a general practitioner. he's nice and easy to talk to without being patronizing.",
-            height=100,
-            help="Enter any text you want to test the model with"
+            "Enter text to test the model",
+            value="This product is absolutely amazing! I love everything about it.",
+            height=100
         )
         
-        col1, col2 = st.columns([3, 1])
-        with col2:
-            predict_button = st.button("🔍 Make Prediction", type="primary", use_container_width=True)
-        
-        if predict_button and test_text:
+        if st.button("🔍 Make Prediction", type="primary"):
             with st.spinner("Making prediction..."):
                 try:
                     # Load tokenizer and model
@@ -599,7 +558,7 @@ with tab3:
                     st.success(f"**Predicted Class: {predicted_class}**")
                     
                     # Show probability distribution
-                    st.subheader("📊 Class Probability Distribution")
+                    st.subheader("Probability Distribution")
                     
                     # Create probability dataframe
                     prob_df = pd.DataFrame({
