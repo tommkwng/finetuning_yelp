@@ -324,7 +324,8 @@ with tab2:
                                 text_field = "content"
                             else:
                                 # Use the first non-label field
-                                text_field = [k for k in examples.keys() if k != "label"][0]
+                                available_fields = [k for k in examples.keys() if k != "label"]
+                                text_field = available_fields[0] if available_fields else list(examples.keys())[0]
                             
                             return st.session_state.tokenizer(
                                 examples[text_field],
@@ -333,11 +334,17 @@ with tab2:
                                 max_length=512
                             )
                         
+                        # Get column names to remove (all except label)
+                        columns_to_remove = [
+                            col for col in st.session_state.dataset["train"].column_names 
+                            if col != "label"
+                        ]
+                        
                         # Apply tokenization
                         tokenized_datasets = st.session_state.dataset.map(
                             tokenize_function,
                             batched=True,
-                            remove_columns=st.session_state.dataset["train"].column_names
+                            remove_columns=columns_to_remove  # Only remove non-label columns
                         )
                         
                         # Set format for PyTorch
@@ -360,6 +367,9 @@ with tab2:
                         
                     except Exception as e:
                         st.error(f"Error during data preprocessing: {e}")
+                        import traceback
+                        with st.expander("View Error Details"):
+                            st.code(traceback.format_exc())
         
         # Model Training
         if st.session_state.data_preprocessed:
